@@ -1,0 +1,9 @@
+[package]
+name = "rustfest-game"
+version = "0.1.0"
+authors = ["Vurich <jackefransham@hotmail.co.uk>"]
+
+[dependencies]
+cgmath = "*"
+piston2d-graphics = "*"
+piston_window = "*"
