@@ -310,7 +310,7 @@ struct Player {
     shared: GameEntity,
 }
 
-#[derive(Clone)]
+#[derive(Debug, Clone)]
 struct GameEntity {
     entity_id: u32,
     owning_team: Team,
@@ -396,6 +396,7 @@ pub struct Drawable {
     scale: f64,
 }
 
+#[derive(Debug)]
 struct ClientDrawable {
     position: Vector2<f64>,
     velocity: Vector2<f64>,
@@ -833,54 +834,49 @@ fn make_server(
             }
         }
 
-        live_players.retain(|player_id| if let Some(player) = players.get_mut(
-            player_id,
-        )
-        {
-            {
-                let Player {
-                    last_fire: ref mut last,
-                    controller: ref mut c,
-                    shared: ref mut e,
-                    acceleration: ref mut acc,
-                } = *player;
+        for player_id in &live_players {
+            if let Some(player) = players.get_mut(&player_id) {
+                {
+                    let Player {
+                        last_fire: ref mut last,
+                        controller: ref mut c,
+                        shared: ref mut e,
+                        acceleration: ref mut acc,
+                    } = *player;
 
-                e.rotation += Rad(c.desired_rotation() * dt) * PLAYER_ROTATION_SPEED;
-                *acc = Basis2::from_angle(e.rotation).rotate_vector(
-                    Vector2::unit_y() * c.desired_thrust() *
-                        PLAYER_THRUST_ACC,
-                );
+                    e.rotation += Rad(c.desired_rotation() * dt) * PLAYER_ROTATION_SPEED;
+                    *acc = Basis2::from_angle(e.rotation).rotate_vector(
+                        Vector2::unit_y() * c.desired_thrust() *
+                            PLAYER_THRUST_ACC,
+                    );
 
-                if c.is_firing() && world_time > *last + PLAYER_FIRE_INTERVAL {
-                    *last = world_time;
+                    if c.is_firing() && world_time > *last + PLAYER_FIRE_INTERVAL {
+                        *last = world_time;
 
-                    let new = bullet(ent_id_gen.next(), &e);
+                        let new = bullet(ent_id_gen.next(), &e);
 
-                    let msg = packets::ServerMessage::NewObject(packets::NewObject {
-                        id: new.shared.entity_id,
-                        drawable: new.drawable(),
-                        initial_info: packets::ObjectInfo {
-                            position: (new.shared.position.x, new.shared.position.y),
-                            velocity: (new.shared.velocity.x, new.shared.velocity.y),
-                            rotation: new.shared.rotation.0,
-                            rotation_speed: 0.,
-                        },
-                    });
+                        let msg = packets::ServerMessage::NewObject(packets::NewObject {
+                            id: new.shared.entity_id,
+                            drawable: new.drawable(),
+                            initial_info: packets::ObjectInfo {
+                                position: (new.shared.position.x, new.shared.position.y),
+                                velocity: (new.shared.velocity.x, new.shared.velocity.y),
+                                rotation: new.shared.rotation.0,
+                                rotation_speed: 0.,
+                            },
+                        });
 
-                    for (_, controller) in controllers.iter_mut() {
-                        controller.send(&msg);
+                        for (_, controller) in controllers.iter_mut() {
+                            controller.send(&msg);
+                        }
+
+                        bullets.push(bullet(ent_id_gen.next(), &e));
                     }
-
-                    bullets.push(bullet(ent_id_gen.next(), &e));
                 }
+
+                player.handle_edges();
             }
-
-            player.handle_edges();
-
-            return true;
-        } else {
-            return false;
-        });
+        }
 
         struct HitMessage {
             killer: Option<Team>,
@@ -990,15 +986,11 @@ fn make_server(
             bullets.retain_index(|i| !dead_entities.contains(&EntityId::Bullet(i)));
         }
 
-        live_players.retain_return(|player_id| if let Some(player) = players.get_mut(
-            player_id,
-        )
-        {
-            update_physics(player, dt);
-            true
-        } else {
-            false
-        });
+        for player_id in &live_players {
+            if let Some(player) = players.get_mut(&player_id) {
+                update_physics(player, dt);
+            }
+        }
 
         for bullet in &mut bullets {
             update_physics(bullet, dt);
@@ -1135,7 +1127,7 @@ fn make_server(
         }
 
         if let Some(remaining_time) =
-            (Instant::now() - start).checked_sub(Duration::new(0, (1_000_000_000. * dt) as _))
+            Duration::new(0, (1_000_000_000. * dt) as _).checked_sub(Instant::now() - start)
         {
             std::thread::sleep(remaining_time);
         }
@@ -1245,7 +1237,7 @@ fn make_client<T: packets::SendRecv<packets::ServerMessage, packets::ClientMessa
             });
         }
 
-        if let Ok(msg) = remote.try_recv() {
+        while let Ok(msg) = remote.try_recv() {
             use packets::ServerMessage::*;
 
             match msg {
