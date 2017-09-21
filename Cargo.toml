@@ -7,3 +7,17 @@ authors = ["Vurich <jackefransham@hotmail.co.uk>"]
 cgmath = "*"
 piston2d-graphics = "*"
 piston_window = "*"
+serde = "*"
+serde_derive = "*"
+rmp = "*"
+rmp-serde = "*"
+arrayvec = "*"
+itertools = "*"
+getopts = "*"
+rusttype = "*"
+rand = "*"
+mio = "*"
+
+[profile.release]
+panic = "abort"
+lto = true
