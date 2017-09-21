@@ -20,4 +20,3 @@ mio = "*"
 
 [profile.release]
 panic = "abort"
-lto = true

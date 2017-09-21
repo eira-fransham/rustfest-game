@@ -27,6 +27,7 @@ use std::collections::{HashMap, HashSet};
 use std::ops::{Add, Sub, Mul};
 use std::sync::mpsc::{self, Sender, Receiver};
 
+const DEFAULT_SERVER_LOCATION: &str = "127.0.0.1:55555";
 const DEJAVU_SANS_MONO: &[u8] = include_bytes!("/usr/share/fonts/TTF/DejaVuSansMono.ttf");
 
 fn lerp<T: Add<Output = T> + Sub<Output = T> + Mul<Output = T> + Copy>(a: T, b: T, bias: T) -> T {
@@ -716,16 +717,14 @@ enum RemoteConnectionType {
     },
 }
 
-fn make_server(
+fn make_server<C: Into<Option<(Sender<packets::ServerMessage>, Receiver<packets::ClientMessage>)>>, T: ToSocketAddrs>(
+    location: T,
     num_teams: usize,
-    client: (Sender<packets::ServerMessage>, Receiver<packets::ClientMessage>),
-) -> ! {
+    client: C,
+) -> !{
     use mio::net::{TcpListener, TcpStream};
     use std::time::{Instant, Duration};
     use packets::Receiver;
-
-    const TCP_PORT: u16 = 55555;
-    const UDP_PORT: u16 = 55556;
 
     let mut controller_id_gen = IdGen(0);
     let mut pending: Vec<
@@ -748,7 +747,9 @@ fn make_server(
         >,
     > = Default::default();
 
-    pending.push(Some(Box::new(client)));
+    if let Some(client) = client.into() {
+        pending.push(Some(Box::new(client)));
+    }
 
     let mut players: HashMap<(u32, u32), Player> = Default::default();
 
@@ -764,7 +765,7 @@ fn make_server(
     // just how it will work for now
     let dt = 1. / 60.;
 
-    let listener = TcpListener::bind(&("127.0.0.1", TCP_PORT as u16)
+    let listener = TcpListener::bind(&location
         .to_socket_addrs()
         .expect("Invalid host or port")
         .next()
@@ -824,7 +825,7 @@ fn make_server(
                     });
 
                     for (_, controller) in controllers.iter_mut() {
-                        controller.send(&msg);
+                        controller.send(&msg).expect("Send failed");
                     }
 
                     *players.get_mut(player_id).unwrap() = new_player;
@@ -867,7 +868,7 @@ fn make_server(
                         });
 
                         for (_, controller) in controllers.iter_mut() {
-                            controller.send(&msg);
+                            controller.send(&msg).expect("Send failed");
                         }
 
                         bullets.push(bullet(ent_id_gen.next(), &e));
@@ -956,7 +957,7 @@ fn make_server(
                 });
 
                 for (_, controller) in controllers.iter_mut() {
-                    controller.send(&msg);
+                    controller.send(&msg).expect("Send failed");
                 }
             }
 
@@ -1077,12 +1078,30 @@ fn make_server(
                 let new_id = controller_id_gen.next();
                 let mut pending = pending.take().unwrap();
 
-                pending.send(srv_handshake);
+                pending.send(srv_handshake).expect("Send failed");
                 controllers.insert(new_id, pending);
 
+                let mut team_sizes = HashMap::new();
+
+                for i in 0..num_teams as u8 {
+                    team_sizes.insert(i, 0);
+                }
+
+                for (_, player) in &players {
+                    *team_sizes.entry(player.shared.owning_team.0).or_insert(0) += 1;
+                }
+
                 for i in 0..handshake.requested_players {
-                    players.insert((new_id, i), player(Team(0), ent_id_gen.next()));
-                    dead_players.push((world_time, (new_id, i)));
+                    let smallest_team = team_sizes
+                        .iter()
+                        .min_by_key(|&(_, size)| size)
+                        .map(|(t, _)| Team(*t))
+                        .unwrap_or(Team(0));
+
+                    *team_sizes.entry(smallest_team.0).or_insert(0) += 1;
+
+                    players.insert((new_id, i), player(smallest_team, ent_id_gen.next()));
+                    dead_players.push((std::f64::NEG_INFINITY, (new_id, i)));
                 }
             }
         }
@@ -1122,7 +1141,7 @@ fn make_server(
             });
 
             for (_, controller) in controllers.iter_mut() {
-                controller.send(&msg);
+                controller.send(&msg).expect("Send failed");
             }
         }
 
@@ -1307,10 +1326,12 @@ fn main() {
     let args = env::args().collect::<Vec<_>>();
     let mut options = Options::new();
     options
+        .optflag("d", "dedicated", "Start the server in dedicated mode")
+        .optopt("s", "serve", "Start a listen server", "SERVER_LOCATION")
         .optopt(
             "c",
             "connect",
-            "Connect to a remote server (if omitted will start its own server)",
+            "Connect to a remote server",
             "REMOTE_SERVER",
         )
         .optopt("t", "teams", "Number of teams (for the server)", "TEAMS")
@@ -1335,9 +1356,23 @@ fn main() {
     remote_server
         .map(|srv| make_remote_client(1, srv))
         .unwrap_or_else(|| {
-            let (to_server, from_client) = mpsc::channel();
-            let (to_client, from_server) = mpsc::channel();
-            std::thread::spawn(|| make_client(1, (to_server, from_server)));
-            make_server(num_teams, (to_client, from_client));
+            let client = if matches.opt_present("dedicated") {
+                None
+            } else {
+                let (to_server, from_client) = mpsc::channel();
+                let (to_client, from_server) = mpsc::channel();
+                std::thread::spawn(|| make_client(1, (to_server, from_server)));
+                Some((to_client, from_client))
+            };
+
+            make_server(
+                matches
+                    .opt_str("serve")
+                    .as_ref()
+                    .map(|s| s as &str)
+                    .unwrap_or(DEFAULT_SERVER_LOCATION),
+                num_teams,
+                client,
+            );
         });
 }
