@@ -22,7 +22,7 @@ use cgmath::*;
 use itertools::*;
 use arrayvec::ArrayVec;
 
-use std::net::{UdpSocket, SocketAddr, ToSocketAddrs};
+use std::net::ToSocketAddrs;
 use std::collections::{HashMap, HashSet};
 use std::ops::{Add, Sub, Mul};
 use std::sync::mpsc::{self, Sender, Receiver};
@@ -182,6 +182,7 @@ mod packets {
     #[derive(Debug, Clone, Serialize, Deserialize)]
     pub struct ServerHandshake {
         pub objects: Vec<(u32, (Drawable, ObjectInfo))>,
+        pub scores: Vec<u32>,
     }
 
     #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -330,20 +331,6 @@ impl Bullet {
 impl Player {
     fn handle_edges(&mut self) {
         self.shared.position = wrap(self.shared.position)
-    }
-
-    fn with_position(self, new: Point2<f64>) -> Self {
-        Player {
-            shared: self.shared.with_position(new),
-            ..self
-        }
-    }
-
-    fn with_rotation(self, new: Rad<f64>) -> Self {
-        Player {
-            shared: self.shared.with_rotation(new),
-            ..self
-        }
     }
 }
 
@@ -547,18 +534,6 @@ impl Entity for Bullet {
     }
 }
 
-impl GameEntity {
-    fn with_position(mut self, new_pos: Point2<f64>) -> Self {
-        self.position = new_pos;
-        self
-    }
-
-    fn with_rotation(mut self, new_rot: Rad<f64>) -> Self {
-        self.rotation = new_rot;
-        self
-    }
-}
-
 fn player(team: Team, id: u32) -> Player {
     Player {
         controller: Default::default(),
@@ -605,7 +580,6 @@ const PLAYER_ROTATION_SPEED: f64 = 5.0;
 const PLAYER_THRUST_ACC: f64 = 2.0;
 const PLAYER_MAX_SPEED: f64 = 0.6;
 const PLAYER_SCALE: f64 = 0.05;
-const INDICATOR_SCALE: f64 = 0.01;
 
 const BULLET_SPEED: f64 = 1.2;
 const BULLET_SCALE: f64 = 0.02;
@@ -704,27 +678,13 @@ impl<A, B, I: Sized + Iterator<Item = (Option<A>, Option<B>)>> FilterUnzip<A, B>
     }
 }
 
-struct RemoteConnection {
-    socket: UdpSocket,
-    connection_type: RemoteConnectionType,
-}
-
-enum RemoteConnectionType {
-    Server { remote: HashMap<usize, Option<SocketAddr>>, },
-    Client {
-        allocated_ids: HashSet<usize>,
-        remote: SocketAddr,
-    },
-}
-
-fn make_server<C: Into<Option<(Sender<packets::ServerMessage>, Receiver<packets::ClientMessage>)>>, T: ToSocketAddrs>(
-    location: T,
-    num_teams: usize,
-    client: C,
-) -> !{
-    use mio::net::{TcpListener, TcpStream};
+fn make_server<C, T>(location: T, num_teams: usize, client: C) -> !
+where
+    C: Into<Option<(Sender<packets::ServerMessage>, Receiver<packets::ClientMessage>)>>,
+    T: ToSocketAddrs,
+{
+    use mio::net::TcpListener;
     use std::time::{Instant, Duration};
-    use packets::Receiver;
 
     let mut controller_id_gen = IdGen(0);
     let mut pending: Vec<
@@ -756,9 +716,8 @@ fn make_server<C: Into<Option<(Sender<packets::ServerMessage>, Receiver<packets:
     let mut live_players: Vec<(u32, u32)> = vec![];
     let mut ent_id_gen = IdGen(0);
     let mut dead_players: Vec<(f64, (u32, u32))> = vec![];
-    let mut team_scores = vec![0; num_teams];
+    let mut team_scores = vec![0u32; num_teams];
     let mut bullets = vec![];
-    let mut live = vec![];
     let mut world_time = 0.;
 
     // The server always runs at a 60fps tickrate. If it slows down, the world slows down. This is
@@ -887,7 +846,7 @@ fn make_server<C: Into<Option<(Sender<packets::ServerMessage>, Receiver<packets:
         let (killing_teams, dead_entities): (Vec<_>, HashSet<_>) = live_players
             .iter()
             .enumerate()
-            .cartesian_product(live.iter().enumerate())
+            .cartesian_product(live_players.iter().enumerate())
             .filter_map(|((ai, a_id), (bi, b_id))| {
                 players
                     .get(a_id)
@@ -943,11 +902,21 @@ fn make_server<C: Into<Option<(Sender<packets::ServerMessage>, Receiver<packets:
             .map(|HitMessage { killer, victim_id }| (killer, Some(victim_id)))
             .filter_unzip();
 
-        for killer in killing_teams {
+        for killer in &killing_teams {
             team_scores[killer.0 as usize] += 1;
         }
 
-        if dead_entities.len() != 0 {
+        if killing_teams.len() > 0 {
+            let msg = packets::ServerMessage::UpdateScore(
+                packets::UpdateScore { scores: team_scores.clone() },
+            );
+
+            for (_, controller) in controllers.iter_mut() {
+                controller.send(&msg).expect("Send failed");
+            }
+        }
+
+        if dead_entities.len() > 0 {
             for dead in &dead_entities {
                 let msg = packets::ServerMessage::DeletedObject(packets::DeletedObject {
                     id: match *dead {
@@ -966,11 +935,7 @@ fn make_server<C: Into<Option<(Sender<packets::ServerMessage>, Receiver<packets:
                 live_players
                     .retain_index(|i| !dead_entities.contains(&EntityId::Player(i)))
                     .into_iter()
-                    .map(|live| {
-                        use std::mem;
-
-                        (world_time, *live)
-                    }),
+                    .map(|live| (world_time, *live)),
             );
             let len_after = dead_players.len();
 
@@ -1022,8 +987,6 @@ fn make_server<C: Into<Option<(Sender<packets::ServerMessage>, Receiver<packets:
             if let Some(Ok(packets::ClientMessage::Handshake(handshake))) =
                 pending.as_mut().map(|p| p.try_recv())
             {
-                use packets::Sender;
-
                 changed = true;
 
                 let srv_handshake = if let Some(ref hsk) = cached_handshake {
@@ -1069,6 +1032,7 @@ fn make_server<C: Into<Option<(Sender<packets::ServerMessage>, Receiver<packets:
                                     ))
                                 }))
                                 .collect(),
+                            scores: team_scores.clone(),
                         },
                     ));
 
@@ -1155,18 +1119,16 @@ fn make_server<C: Into<Option<(Sender<packets::ServerMessage>, Receiver<packets:
 
 fn make_remote_client<T: ToSocketAddrs>(num_local_players: usize, remote: T) {
     use mio::net::TcpStream;
-    use packets::Sender;
-
-    const MIN_PORT: u16 = 55557;
-    const MAX_PORT: u16 = 55657;
 
     let remote = remote
         .to_socket_addrs()
         .ok()
         .and_then(|mut i| i.next())
         .expect("Remote address incorrectly specified");
-    let mut connection = TcpStream::connect(&remote).expect("Couldn't reach remote server");
-    make_client(num_local_players, connection)
+    make_client(
+        num_local_players,
+        TcpStream::connect(&remote).expect("Couldn't reach remote server"),
+    );
 }
 
 fn make_client<T: packets::SendRecv<packets::ServerMessage, packets::ClientMessage>>(
@@ -1279,6 +1241,8 @@ fn make_client<T: packets::SendRecv<packets::ServerMessage, packets::ClientMessa
                             },
                         );
                     }
+
+                    team_scores = msg.scores;
                 }
                 Tick(msg) => {
                     for (id, info) in msg.info {
@@ -1313,7 +1277,7 @@ fn make_client<T: packets::SendRecv<packets::ServerMessage, packets::ClientMessa
                 DeletedObject(msg) => {
                     entities.remove(&msg.id);
                 }
-                UpdateScore(msg) => {}
+                UpdateScore(msg) => team_scores = msg.scores,
             }
         }
     }
