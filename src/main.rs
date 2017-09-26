@@ -1,9 +1,7 @@
-#![feature(conservative_impl_trait)]
-
 #[macro_use]
 extern crate serde_derive;
 
-extern crate arrayvec;
+extern crate smallvec;
 extern crate serde;
 extern crate rmp;
 extern crate rmp_serde;
@@ -16,11 +14,11 @@ extern crate rusttype;
 extern crate rand;
 extern crate mio;
 
+use smallvec::SmallVec;
 use piston_window::*;
 use graphics::math::*;
 use cgmath::*;
 use itertools::*;
-use arrayvec::ArrayVec;
 
 use std::net::ToSocketAddrs;
 use std::collections::{HashMap, HashSet};
@@ -70,58 +68,179 @@ pub enum GameKey {
 }
 
 mod packets {
-    use super::{GameKey, Drawable};
+    #![allow(dead_code)]
+
+    use std::net::SocketAddr;
+    use std::io;
+    use mio::net::{TcpStream, UdpSocket};
+    use smallvec::SmallVec;
+    use super::{ControllerState, Drawable};
+
+    pub trait PrioSend<Out> {
+        fn send_high(&mut self, val: &Out) -> Result<(), io::Error>;
+        fn send_low(&mut self, val: &Out) -> Result<(), io::Error>;
+    }
+
+    impl<Out, A: Sender<Out>, B> PrioSend<Out> for (A, B) {
+        fn send_high(&mut self, val: &Out) -> Result<(), io::Error> {
+            self.0.send(val)
+        }
+        fn send_low(&mut self, val: &Out) -> Result<(), io::Error> {
+            self.0.send(val)
+        }
+    }
+
+    impl<Out: ::serde::Serialize> PrioSend<Out> for TcpStream {
+        fn send_high(&mut self, val: &Out) -> Result<(), io::Error> {
+            self.send(val)
+        }
+
+        fn send_low(&mut self, val: &Out) -> Result<(), io::Error> {
+            use rmp_serde::encode::{self, Error};
+            use rmp::encode::ValueWriteError;
+
+            encode::write(self, val).map_err(|e| match e {
+                Error::InvalidValueWrite(ValueWriteError::InvalidMarkerWrite(e)) |
+                Error::InvalidValueWrite(ValueWriteError::InvalidDataWrite(e)) => e,
+                _ => io::Error::from(io::ErrorKind::Other),
+            })
+        }
+    }
+
+    pub struct PrioSocket {
+        high: TcpStream,
+        low: NoncedUdpStream,
+    }
+
+    impl PrioSocket {
+        pub fn connect(addr: &SocketAddr) -> io::Result<Self> {
+            Self::from_tcp(TcpStream::connect(addr)?)
+        }
+
+        pub fn from_tcp(stream: TcpStream) -> io::Result<Self> {
+            let _ = stream.set_nodelay(true);
+            let low = NoncedUdpStream::connect(&stream.local_addr()?, &stream.peer_addr()?)?;
+            Ok(PrioSocket {
+                high: stream,
+                low: low,
+            })
+        }
+    }
+
+    impl<Out: ::serde::Serialize> PrioSend<Out> for PrioSocket {
+        fn send_high(&mut self, val: &Out) -> Result<(), io::Error> {
+            self.high.send(val)
+        }
+        fn send_low(&mut self, val: &Out) -> Result<(), io::Error> {
+            self.low.send(val)
+        }
+    }
+
+    impl<In: for<'a> ::serde::Deserialize<'a>> Receiver<In> for PrioSocket {
+        fn try_recv(&mut self) -> Result<In, io::Error> {
+            self.high.try_recv().or_else(|_| self.low.try_recv())
+        }
+    }
 
     pub trait Sender<T> {
-        fn send(&mut self, val: &T) -> Result<(), ::std::io::Error>;
+        fn send(&mut self, val: &T) -> Result<(), io::Error>;
     }
 
     pub trait Receiver<T> {
-        fn try_recv(&mut self) -> Result<T, ::std::io::Error>;
+        fn try_recv(&mut self) -> Result<T, io::Error>;
     }
 
-    pub trait SendRecv<In, Out> {
-        fn send(&mut self, val: &Out) -> Result<(), ::std::io::Error>;
-        fn try_recv(&mut self) -> Result<In, ::std::io::Error>;
-    }
+    pub trait SendRecv<In, Out>: PrioSend<Out> + Receiver<In> {}
 
-    impl<In: for<'a> ::serde::Deserialize<'a>, Out: ::serde::Serialize> SendRecv<In, Out>
-        for ::mio::net::TcpStream {
-        fn send(&mut self, val: &Out) -> Result<(), ::std::io::Error> {
-            <Self as Sender<Out>>::send(self, val)
-        }
-        fn try_recv(&mut self) -> Result<In, ::std::io::Error> {
-            <Self as Receiver<In>>::try_recv(self)
-        }
-    }
+    impl<In, Out, T: PrioSend<Out> + Receiver<In>> SendRecv<In, Out> for T {}
 
-    impl<In, Out, A: Sender<Out>, B: Receiver<In>> SendRecv<In, Out> for (A, B) {
-        fn send(&mut self, val: &Out) -> Result<(), ::std::io::Error> {
+    impl<T, A: Sender<T>, B> Sender<T> for (A, B) {
+        fn send(&mut self, val: &T) -> Result<(), io::Error> {
             self.0.send(val)
         }
-        fn try_recv(&mut self) -> Result<In, ::std::io::Error> {
+    }
+
+    impl<T, A, B: Receiver<T>> Receiver<T> for (A, B) {
+        fn try_recv(&mut self) -> Result<T, io::Error> {
             self.1.try_recv()
         }
     }
 
     impl<T: Clone> Sender<T> for ::std::sync::mpsc::Sender<T> {
-        fn send(&mut self, val: &T) -> Result<(), ::std::io::Error> {
-            // Sorry, you can't get your value back (maybe fix this later)
+        fn send(&mut self, val: &T) -> Result<(), io::Error> {
             ::std::sync::mpsc::Sender::send(&*self, val.clone())
                 .map_err(|_| ::std::io::Error::from(::std::io::ErrorKind::Other))
         }
     }
 
-    impl<T: ::serde::Serialize> Sender<T> for ::mio::net::TcpStream {
-        fn send(&mut self, val: &T) -> Result<(), ::std::io::Error> {
-            use rmp_serde::encode::Error;
+    // TODO: Make this act like a `TcpStream` that silently turns out-of-order packets into dropped
+    //       packets.
+    struct NoncedUdpStream {
+        stream: UdpSocket,
+        out_nonce: u32,
+        in_nonce: Option<u32>,
+    }
+
+    #[derive(Debug, Clone, Serialize, Deserialize)]
+    struct NoncedMessage<T>(u32, T);
+
+    impl NoncedUdpStream {
+        fn connect(local: &SocketAddr, remote: &SocketAddr) -> io::Result<Self> {
+            let backing_socket = UdpSocket::bind(local)?;
+            backing_socket.connect(*remote)?;
+
+            Ok(NoncedUdpStream {
+                stream: backing_socket,
+                in_nonce: None,
+                out_nonce: 0,
+            })
+        }
+    }
+
+    impl<T: ::serde::Serialize> Sender<T> for NoncedUdpStream {
+        fn send(&mut self, val: &T) -> Result<(), io::Error> {
+            use rmp_serde::encode::{self, Error};
             use rmp::encode::ValueWriteError;
 
-            ::rmp_serde::encode::write(self, val).map_err(|e| match e {
-                Error::InvalidValueWrite(ValueWriteError::InvalidMarkerWrite(e)) |
-                Error::InvalidValueWrite(ValueWriteError::InvalidDataWrite(e)) => e,
-                _ => ::std::io::Error::from(::std::io::ErrorKind::Other),
-            })
+            let mut buffer: SmallVec<[u8; 1024]> = SmallVec::new();
+            let nonce = self.out_nonce;
+            self.out_nonce += 1;
+
+            let to_encode: NoncedMessage<&T> = NoncedMessage(nonce, val);
+            encode::write(&mut buffer, &to_encode).map_err(|e| {
+                println!("{:?}", e);
+                match e {
+                    Error::InvalidValueWrite(ValueWriteError::InvalidMarkerWrite(e)) |
+                    Error::InvalidValueWrite(ValueWriteError::InvalidDataWrite(e)) => e,
+                    _ => io::Error::from(io::ErrorKind::Other),
+                }
+            })?;
+
+            let mut to_write: &[u8] = &buffer;
+            self.stream.send(&buffer).map(|_| ())
+        }
+    }
+
+    impl<T: ::serde::Serialize> Sender<T> for TcpStream {
+        fn send(&mut self, val: &T) -> Result<(), io::Error> {
+            use rmp_serde::encode::{self, Error};
+            use rmp::encode::ValueWriteError;
+
+            loop {
+                let out = encode::write(self, val).map_err(|e| match e {
+                    Error::InvalidValueWrite(ValueWriteError::InvalidMarkerWrite(e)) |
+                    Error::InvalidValueWrite(ValueWriteError::InvalidDataWrite(e)) => e,
+                    _ => io::Error::from(io::ErrorKind::Other),
+                });
+
+                if let &Err(ref e) = &out {
+                    if e.kind() == io::ErrorKind::WouldBlock {
+                        continue;
+                    }
+                }
+
+                return out;
+            }
         }
     }
 
@@ -152,10 +271,39 @@ mod packets {
         }
     }
 
+    impl<T: for<'a> ::serde::Deserialize<'a>> Receiver<T> for NoncedUdpStream {
+        fn try_recv(&mut self) -> Result<T, ::std::io::Error> {
+            use rmp_serde::decode::Error;
+            let mut buffer: [u8; 1024] = [0; 1024];
+
+            let num_read = self.stream.recv(&mut buffer)?;
+
+            let nonced: NoncedMessage<T> = ::rmp_serde::from_slice(&buffer[..num_read]).map_err(|e| {
+                println!("{:?}", e);
+                match e {
+                    Error::InvalidMarkerRead(e) |
+                    Error::InvalidDataRead(e) => e,
+                    _ => ::std::io::Error::from(::std::io::ErrorKind::Other),
+                }
+            })?;
+
+            if self.in_nonce.map(|nonce| nonced.0 <= nonce).unwrap_or(
+                false,
+            )
+            {
+                return Err(::std::io::Error::from(::std::io::ErrorKind::Other));
+            }
+
+            self.in_nonce = Some(nonced.0);
+
+            Ok(nonced.1)
+        }
+    }
+
     #[derive(Clone, Serialize, Deserialize)]
     pub enum ClientMessage {
         Handshake(ClientHandshake),
-        ControllerUpdate(ControllerUpdate),
+        ControllerUpdate(u32, ControllerState),
     }
 
     #[derive(Clone, Serialize, Deserialize)]
@@ -163,36 +311,36 @@ mod packets {
         pub requested_players: u32,
     }
 
-    #[derive(Clone, Serialize, Deserialize)]
-    pub struct ControllerUpdate {
-        pub local_id: u32,
-        pub state: bool,
-        pub key: GameKey,
-    }
-
     #[derive(Debug, Clone, Serialize, Deserialize)]
     pub enum ServerMessage {
         Handshake(ServerHandshake),
         Tick(Tick),
-        NewObject(NewObject),
-        DeletedObject(DeletedObject),
+        AddRemove(AddRemove),
         UpdateScore(UpdateScore),
     }
 
     #[derive(Debug, Clone, Serialize, Deserialize)]
     pub struct ServerHandshake {
-        pub objects: Vec<(u32, (Drawable, ObjectInfo))>,
-        pub scores: Vec<u32>,
+        pub objects: SmallVec<[(u32, (Drawable, ObjectInfo)); 128]>,
+        pub scores: SmallVec<[u32; 8]>,
     }
 
     #[derive(Debug, Clone, Serialize, Deserialize)]
     pub struct Tick {
-        pub info: Vec<(u32, ObjectInfo)>,
+        pub time: f64,
+        pub info: SmallVec<[(u32, ObjectInfo); 128]>,
+    }
+
+    #[derive(Debug, Clone, Serialize, Deserialize)]
+    pub struct AddRemove {
+        pub new: SmallVec<[NewObject; 4]>,
+        pub deleted: SmallVec<[u32; 4]>,
     }
 
     #[derive(Debug, Clone, Serialize, Deserialize)]
     pub struct NewObject {
         pub id: u32,
+        pub time: f64,
         pub drawable: Drawable,
         pub initial_info: ObjectInfo,
     }
@@ -204,7 +352,7 @@ mod packets {
 
     #[derive(Debug, Clone, Serialize, Deserialize)]
     pub struct UpdateScore {
-        pub scores: Vec<u32>,
+        pub scores: SmallVec<[u32; 8]>,
     }
 
     #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -217,7 +365,7 @@ mod packets {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, Default)]
-struct ControllerState {
+pub struct ControllerState {
     up: bool,
     down: bool,
     left: bool,
@@ -344,6 +492,7 @@ enum EntityId {
 enum GamePoly {
     Player,
     Bullet,
+    Asteroid(usize),
 }
 
 impl From<GamePoly> for &'static [[f64; 2]] {
@@ -353,6 +502,7 @@ impl From<GamePoly> for &'static [[f64; 2]] {
         match poly {
             Player => &PLAYER_POLY,
             Bullet => &BULLET_POLY,
+            Asteroid(id) => ASTEROIDS[id],
         }
     }
 }
@@ -394,7 +544,7 @@ struct ClientDrawable {
 }
 
 impl ClientDrawable {
-    fn transformations(&self) -> ArrayVec<[Matrix2d; 3]> {
+    fn transformations(&self) -> SmallVec<[Matrix2d; 3]> {
         fn transformation_with_offset(
             position: Vector2<f64>,
             rotation: Rad<f64>,
@@ -405,7 +555,7 @@ impl ClientDrawable {
                 .rot_rad(rotation.0)
         }
 
-        let mut out = ArrayVec::new();
+        let mut out = SmallVec::new();
         out.push(transformation_with_offset(
             self.position,
             self.rotation,
@@ -573,6 +723,58 @@ fn wrap(p: Point2<f64>) -> Point2<f64> {
 
 static PLAYER_POLY: [[f64; 2]; 4] = [[0., 1.], [1., -1.], [0., -0.5], [-1., -1.]];
 static BULLET_POLY: [[f64; 2]; 4] = [[0., 1.], [1., 0.], [0., -1.], [-1., 0.]];
+static ASTEROIDS: &[&[[f64; 2]]] = &[
+    &[
+        [0.11, 1.24],
+        [1.0, 0.96],
+        [1.35, -0.17],
+        [0.64, -0.64],
+        [0.09, -1.05],
+        [-0.7, -0.54],
+        [-0.89, -0.11],
+        [-0.53, 0.54],
+    ],
+    &[
+        [0.02, 0.78],
+        [0.93, 0.86],
+        [1.15, -0.04],
+        [0.7, -0.71],
+        [0.19, -1.24],
+        [-0.95, -0.85],
+        [-1.06, -0.05],
+        [-0.91, 0.71],
+    ],
+    &[
+        [-0.04, 0.96],
+        [0.57, 0.67],
+        [0.88, 0.06],
+        [0.83, -1.09],
+        [0.12, -0.81],
+        [-0.54, -0.54],
+        [-0.61, 0.04],
+        [-0.59, 0.78],
+    ],
+    &[
+        [0.06, 1.02],
+        [0.54, 0.45],
+        [1.3, 0.04],
+        [0.71, -0.79],
+        [0.08, -1.39],
+        [-0.71, -0.77],
+        [-0.82, 0.05],
+        [-0.89, 0.84],
+    ],
+    &[
+        [0.15, 1.04],
+        [0.71, 0.53],
+        [0.92, 0.05],
+        [0.65, -0.88],
+        [-0.08, -1.07],
+        [-0.8, -0.69],
+        [-1.12, 0.01],
+        [-1.02, 0.75],
+    ],
+];
 
 const PLAYER_DEAD_TIME: f64 = 5.0;
 const PLAYER_FIRE_INTERVAL: f64 = 0.2;
@@ -686,39 +888,23 @@ where
     use mio::net::TcpListener;
     use std::time::{Instant, Duration};
 
-    let mut controller_id_gen = IdGen(0);
-    let mut pending: Vec<
-        Option<
-            Box<
-                packets::SendRecv<
-                    packets::ClientMessage,
-                    packets::ServerMessage,
-                >,
-            >,
-        >,
-    > = vec![];
-    let mut controllers: HashMap<
-        u32,
-        Box<
-            packets::SendRecv<
-                packets::ClientMessage,
-                packets::ServerMessage,
-            >,
-        >,
-    > = Default::default();
+    type Remote = Box<packets::SendRecv<packets::ClientMessage, packets::ServerMessage>>;
 
-    if let Some(client) = client.into() {
-        pending.push(Some(Box::new(client)));
-    }
+    let mut controller_id_gen = IdGen(0);
+    let mut pending: Vec<Option<Remote>> = vec![client.into().map(|client| Box::new(client) as _)];
+
+    let mut controllers: HashMap<u32, Remote> = Default::default();
 
     let mut players: HashMap<(u32, u32), Player> = Default::default();
 
     let mut live_players: Vec<(u32, u32)> = vec![];
     let mut ent_id_gen = IdGen(0);
     let mut dead_players: Vec<(f64, (u32, u32))> = vec![];
-    let mut team_scores = vec![0u32; num_teams];
+    let mut team_scores = SmallVec::from_vec(vec![0u32; num_teams]);
     let mut bullets = vec![];
     let mut world_time = 0.;
+    let mut new_object_messages = SmallVec::new();
+    let mut deleted_object_messages = SmallVec::new();
 
     // The server always runs at a 60fps tickrate. If it slows down, the world slows down. This is
     // just how it will work for now
@@ -738,7 +924,7 @@ where
             let to_spawn =
                 dead_players.retain_return(|&mut (time, _)| world_time < time + PLAYER_DEAD_TIME);
 
-            if to_spawn.len() > 0 {
+            if !to_spawn.is_empty() {
                 use rand::{Rng, StdRng};
 
                 let mut rng = StdRng::new().expect("Can't access RNG");
@@ -772,7 +958,8 @@ where
                         panic!("Player left! (FIXME)");
                     };
 
-                    let msg = packets::ServerMessage::NewObject(packets::NewObject {
+                    new_object_messages.push(packets::NewObject {
+                        time: world_time,
                         id: new_player.shared.entity_id,
                         drawable: new_player.drawable(),
                         initial_info: packets::ObjectInfo {
@@ -782,10 +969,6 @@ where
                             rotation_speed: 0.,
                         },
                     });
-
-                    for (_, controller) in controllers.iter_mut() {
-                        controller.send(&msg).expect("Send failed");
-                    }
 
                     *players.get_mut(player_id).unwrap() = new_player;
 
@@ -815,7 +998,8 @@ where
 
                         let new = bullet(ent_id_gen.next(), &e);
 
-                        let msg = packets::ServerMessage::NewObject(packets::NewObject {
+                        new_object_messages.push(packets::NewObject {
+                            time: world_time,
                             id: new.shared.entity_id,
                             drawable: new.drawable(),
                             initial_info: packets::ObjectInfo {
@@ -825,10 +1009,6 @@ where
                                 rotation_speed: 0.,
                             },
                         });
-
-                        for (_, controller) in controllers.iter_mut() {
-                            controller.send(&msg).expect("Send failed");
-                        }
 
                         bullets.push(bullet(ent_id_gen.next(), &e));
                     }
@@ -860,18 +1040,19 @@ where
                     })
             })
             .flat_map(|(a, b)| {
-                ArrayVec::from(
-                    [
-                        HitMessage {
-                            killer: None,
-                            victim_id: EntityId::Player(a),
-                        },
-                        HitMessage {
-                            killer: None,
-                            victim_id: EntityId::Player(b),
-                        },
-                    ],
-                )
+                // Hack because fixed-size slices have no ownership-taking iteration methods
+                let mut out: SmallVec<[_; 2]> = SmallVec::new();
+
+                out.push(HitMessage {
+                    killer: None,
+                    victim_id: EntityId::Player(a),
+                });
+                out.push(HitMessage {
+                    killer: None,
+                    victim_id: EntityId::Player(b),
+                });
+
+                out
             })
             .chain(
                 live_players
@@ -885,18 +1066,19 @@ where
                         None
                     })
                     .flat_map(|(a, (b, team))| {
-                        ArrayVec::from(
-                            [
-                                HitMessage {
-                                    killer: Some(team),
-                                    victim_id: EntityId::Player(a),
-                                },
-                                HitMessage {
-                                    killer: None,
-                                    victim_id: EntityId::Bullet(b),
-                                },
-                            ],
-                        )
+                        // Hack because fixed-size slices have no ownership-taking iteration methods
+                        let mut out: SmallVec<[_; 2]> = SmallVec::new();
+
+                        out.push(HitMessage {
+                            killer: Some(team),
+                            victim_id: EntityId::Player(a),
+                        });
+                        out.push(HitMessage {
+                            killer: None,
+                            victim_id: EntityId::Bullet(b),
+                        });
+
+                        out
                     }),
             )
             .map(|HitMessage { killer, victim_id }| (killer, Some(victim_id)))
@@ -906,29 +1088,21 @@ where
             team_scores[killer.0 as usize] += 1;
         }
 
-        if killing_teams.len() > 0 {
+        if !killing_teams.is_empty() {
             let msg = packets::ServerMessage::UpdateScore(
                 packets::UpdateScore { scores: team_scores.clone() },
             );
 
             for (_, controller) in controllers.iter_mut() {
-                controller.send(&msg).expect("Send failed");
+                controller.send_high(&msg).expect("Send failed");
             }
         }
 
-        if dead_entities.len() > 0 {
-            for dead in &dead_entities {
-                let msg = packets::ServerMessage::DeletedObject(packets::DeletedObject {
-                    id: match *dead {
-                        EntityId::Player(i) => players[&live_players[i]].shared.entity_id,
-                        EntityId::Bullet(i) => bullets[i].shared.entity_id,
-                    },
-                });
-
-                for (_, controller) in controllers.iter_mut() {
-                    controller.send(&msg).expect("Send failed");
-                }
-            }
+        if !dead_entities.is_empty() {
+            deleted_object_messages.extend(dead_entities.iter().map(|dead| match *dead {
+                EntityId::Player(i) => players[&live_players[i]].shared.entity_id,
+                EntityId::Bullet(i) => bullets[i].shared.entity_id,
+            }));
 
             let len_before = dead_players.len();
             dead_players.extend(
@@ -964,19 +1138,19 @@ where
 
         bullets.retain(|e| !e.should_die());
 
-        if let Ok((stream, _)) = listener.accept() {
-            pending.push(Some(Box::new(stream)));
+        while let Ok((stream, _)) = listener.accept() {
+            let _ = stream.set_nodelay(true);
+            pending.push(Some(Box::new(packets::PrioSocket::from_tcp(stream).expect(
+                "Couldn't connect back",
+            ))));
         }
 
         for (id, c) in controllers.iter_mut() {
-            if let Ok(packets::ClientMessage::ControllerUpdate(packets::ControllerUpdate {
-                                                                   local_id,
-                                                                   state,
-                                                                   key,
-                                                               })) = c.try_recv()
+            while let Ok(packets::ClientMessage::ControllerUpdate(local_id, update)) =
+                c.try_recv()
             {
                 if let Some(val) = players.get_mut(&(*id, local_id)) {
-                    val.controller.update(key, state);
+                    val.controller = update;
                 }
             }
         }
@@ -1042,7 +1216,7 @@ where
                 let new_id = controller_id_gen.next();
                 let mut pending = pending.take().unwrap();
 
-                pending.send(srv_handshake).expect("Send failed");
+                pending.send_high(srv_handshake).expect("Send failed");
                 controllers.insert(new_id, pending);
 
                 let mut team_sizes = HashMap::new();
@@ -1074,8 +1248,24 @@ where
             pending.retain(|f| f.is_some());
         }
 
-        if live_players.len() > 0 {
-            let msg = packets::ServerMessage::Tick(packets::Tick {
+        if !live_players.is_empty() {
+            use std::mem;
+
+            let add_remove_msg = {
+                let msg = packets::AddRemove {
+                    new: mem::replace(&mut new_object_messages, Default::default()),
+                    deleted: mem::replace(&mut deleted_object_messages, Default::default()),
+                };
+
+                if msg.new.is_empty() && msg.deleted.is_empty() {
+                    None
+                } else {
+                    Some(packets::ServerMessage::AddRemove(msg))
+                }
+            };
+
+            let tick_msg = packets::ServerMessage::Tick(packets::Tick {
+                time: world_time,
                 info: live_players
                     .iter()
                     .filter_map(|pid| players.get(pid))
@@ -1105,7 +1295,11 @@ where
             });
 
             for (_, controller) in controllers.iter_mut() {
-                controller.send(&msg).expect("Send failed");
+                controller.send_low(&tick_msg).expect("Send failed");
+
+                if let Some(ref msg) = add_remove_msg {
+                    controller.send_high(msg).expect("Send failed");
+                }
             }
         }
 
@@ -1120,18 +1314,19 @@ where
 fn make_remote_client<T: ToSocketAddrs>(num_local_players: usize, remote: T) {
     use mio::net::TcpStream;
 
-    let remote = remote
+    let remote_addr = remote
         .to_socket_addrs()
         .ok()
         .and_then(|mut i| i.next())
         .expect("Remote address incorrectly specified");
-    make_client(
-        num_local_players,
-        TcpStream::connect(&remote).expect("Couldn't reach remote server"),
-    );
+    let remote = packets::PrioSocket::connect(&remote_addr).expect("Couldn't reach remote server");
+    make_client(num_local_players, remote);
 }
 
-fn make_client<T: packets::SendRecv<packets::ServerMessage, packets::ClientMessage>>(
+fn make_client<
+    T: packets::PrioSend<packets::ClientMessage>
+        + packets::Receiver<packets::ServerMessage>,
+>(
     num_local_players: usize,
     mut remote: T,
 ) {
@@ -1151,15 +1346,17 @@ fn make_client<T: packets::SendRecv<packets::ServerMessage, packets::ClientMessa
 
     let mut controllers: Vec<ControllerState> = vec![Default::default(); num_local_players];
     let mut entities: HashMap<u32, ClientDrawable> = HashMap::new();
-    let mut team_scores: Vec<u32> = vec![];
+    let mut team_scores: SmallVec<[u32; 8]> = SmallVec::new();
 
     remote
-        .send(&packets::ClientMessage::Handshake(
+        .send_high(&packets::ClientMessage::Handshake(
             packets::ClientHandshake {
                 requested_players: num_local_players as _,
             },
         ))
         .expect("Couldn't send");
+
+    let mut new: SmallVec<[packets::NewObject; 4]> = SmallVec::new();
 
     while let Some(event) = window.next() {
         if let Some(UpdateArgs { dt }) = event.update_args() {
@@ -1167,17 +1364,16 @@ fn make_client<T: packets::SendRecv<packets::ServerMessage, packets::ClientMessa
                 ent.position += ent.velocity * dt;
                 ent.rotation += ent.rotation_speed * dt;
             }
-        } else if let Some(button_args) = event.button_args() {
-            for (i, controller) in controllers.iter_mut().enumerate() {
-                if let Some((is_down, game_key)) = controller.to_game_key(&button_args) {
-                    let _ = remote.send(&packets::ClientMessage::ControllerUpdate(
-                        packets::ControllerUpdate {
-                            local_id: i as _,
-                            state: is_down,
-                            key: game_key.clone(),
-                        },
-                    ));
 
+            for (id, state) in controllers.iter().enumerate() {
+                let _ = remote.send_low(&packets::ClientMessage::ControllerUpdate(
+                    id as _,
+                    state.clone(),
+                ));
+            }
+        } else if let Some(button_args) = event.button_args() {
+            for controller in controllers.iter_mut() {
+                if let Some((is_down, game_key)) = controller.to_game_key(&button_args) {
                     controller.update(game_key, is_down);
                 }
             }
@@ -1218,6 +1414,9 @@ fn make_client<T: packets::SendRecv<packets::ServerMessage, packets::ClientMessa
             });
         }
 
+        let mut tick: Option<packets::Tick> = None;
+        let mut deleted: SmallVec<[u32; 4]> = SmallVec::new();
+
         while let Ok(msg) = remote.try_recv() {
             use packets::ServerMessage::*;
 
@@ -1244,40 +1443,53 @@ fn make_client<T: packets::SendRecv<packets::ServerMessage, packets::ClientMessa
 
                     team_scores = msg.scores;
                 }
+                AddRemove(msg) => {
+                    new.extend(msg.new);
+                    deleted.extend(msg.deleted);
+                }
                 Tick(msg) => {
-                    for (id, info) in msg.info {
-                        if let Some(ent) = entities.get_mut(&id) {
-                            ent.position.x = info.position.0;
-                            ent.position.y = info.position.1;
-                            ent.velocity.x = info.velocity.0;
-                            ent.velocity.y = info.velocity.1;
-                            ent.rotation = Rad(info.rotation);
-                            ent.rotation_speed = Rad(info.rotation_speed);
-                        }
-                    }
-                }
-                NewObject(msg) => {
-                    entities.insert(
-                        msg.id,
-                        ClientDrawable {
-                            position: Vector2 {
-                                x: msg.initial_info.position.0,
-                                y: msg.initial_info.position.1,
-                            },
-                            velocity: Vector2 {
-                                x: msg.initial_info.velocity.0,
-                                y: msg.initial_info.velocity.1,
-                            },
-                            rotation: Rad(msg.initial_info.rotation),
-                            rotation_speed: Rad(msg.initial_info.rotation_speed),
-                            drawable: msg.drawable,
-                        },
-                    );
-                }
-                DeletedObject(msg) => {
-                    entities.remove(&msg.id);
+                    tick = Some(msg);
                 }
                 UpdateScore(msg) => team_scores = msg.scores,
+            }
+        }
+
+        for id in deleted {
+            entities.remove(&id);
+        }
+
+        if let Some(msg) = tick {
+            for (id, info) in msg.info {
+                if let Some(ent) = entities.get_mut(&id) {
+                    ent.position.x = info.position.0;
+                    ent.position.y = info.position.1;
+                    ent.velocity.x = info.velocity.0;
+                    ent.velocity.y = info.velocity.1;
+                    ent.rotation = Rad(info.rotation);
+                    ent.rotation_speed = Rad(info.rotation_speed);
+                }
+            }
+
+            for new in new.drain() {
+                let pos = Vector2 {
+                    x: new.initial_info.position.0,
+                    y: new.initial_info.position.1,
+                };
+                let vel = Vector2 {
+                    x: new.initial_info.velocity.0,
+                    y: new.initial_info.velocity.1,
+                };
+
+                entities.insert(
+                    new.id,
+                    ClientDrawable {
+                        position: pos + vel * (msg.time - new.time),
+                        velocity: vel,
+                        rotation: Rad(new.initial_info.rotation),
+                        rotation_speed: Rad(new.initial_info.rotation_speed),
+                        drawable: new.drawable,
+                    },
+                );
             }
         }
     }

@@ -11,12 +11,15 @@ serde = "*"
 serde_derive = "*"
 rmp = "*"
 rmp-serde = "*"
-arrayvec = "*"
 itertools = "*"
 getopts = "*"
 rusttype = "*"
 rand = "*"
 mio = "*"
+
+[dependencies.smallvec]
+version = "*"
+features = ["serde"]
 
 [profile.release]
 panic = "abort"
